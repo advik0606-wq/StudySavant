@@ -5,28 +5,48 @@
       "description": "User profile information",
       "type": "object",
       "properties": {
-        "uid": { "type": "string" },
-        "email": { "type": "string" },
-        "displayName": { "type": "string" },
-        "photoURL": { "type": "string" },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "uid": { "type": "string", "description": "Unique identifier for the user" },
+        "email": { "type": "string", "format": "email", "description": "User's email address" },
+        "displayName": { "type": "string", "description": "User's display name" },
+        "photoURL": { "type": "string", "description": "User's profile picture URL" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "When the user account was created" }
       },
       "required": ["uid", "email"]
     },
     "StudySet": {
       "title": "Study Set",
-      "description": "A collection of notes, quizzes, and flashcards",
+      "description": "A complete study set containing notes, quiz, and flashcards",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
         "userId": { "type": "string" },
         "title": { "type": "string" },
         "content": { "type": "string" },
-        "quiz": { "type": "array" },
-        "flashcards": { "type": "array" },
+        "quiz": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "question": { "type": "string" },
+              "options": { "type": "array", "items": { "type": "string" } },
+              "correctAnswer": { "type": "integer" },
+              "explanation": { "type": "string" }
+            }
+          }
+        },
+        "flashcards": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "front": { "type": "string" },
+              "back": { "type": "string" }
+            }
+          }
+        },
         "createdAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["userId", "title", "content"]
+      "required": ["userId", "title", "content", "quiz", "flashcards", "createdAt"]
     }
   },
   "firestore": {
@@ -36,7 +56,7 @@
     },
     "/studySets/{setId}": {
       "schema": "StudySet",
-      "description": "User study sets containing notes and generated content"
+      "description": "Complete study materials"
     }
   }
 }

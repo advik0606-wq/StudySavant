@@ -23,12 +23,108 @@ import mammoth from 'mammoth';
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 import { auth, signIn, logOut, db } from './firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
-import { collection, query, where, onSnapshot, addDoc, serverTimestamp, doc, setDoc } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, addDoc, serverTimestamp, doc, setDoc, getDocFromServer } from 'firebase/firestore';
 import { generateStudyMaterials } from './lib/gemini';
 import { StudySet, ViewState } from './types';
 import confetti from 'canvas-confetti';
 
+// --- Error Handling ---
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
 // --- Components ---
+
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: Error | null }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      let errorMessage = "Something went wrong.";
+      try {
+        const parsed = JSON.parse(this.state.error?.message || "");
+        if (parsed.error) errorMessage = `Database Error: ${parsed.error}`;
+      } catch {
+        errorMessage = this.state.error?.message || errorMessage;
+      }
+
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-zinc-50 p-4">
+          <div className="glass p-8 rounded-3xl max-w-md w-full text-center">
+            <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-6">
+              <X size={32} />
+            </div>
+            <h2 className="text-2xl font-display font-bold mb-4">Application Error</h2>
+            <p className="text-zinc-600 mb-8">{errorMessage}</p>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full bg-zinc-900 text-white py-3 rounded-xl font-bold hover:bg-zinc-800 transition-all"
+            >
+              Reload Application
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
 
 const Navbar = ({ user, setView, activeView }: { user: User | null, setView: (v: ViewState) => void, activeView: ViewState }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
@@ -231,8 +327,12 @@ const NoteUpload = ({ onComplete }: { onComplete: (set: StudySet) => void }) => 
         createdAt: new Date().toISOString()
       };
 
-      const docRef = await addDoc(collection(db, 'studySets'), studySetData);
-      onComplete({ id: docRef.id, ...studySetData } as StudySet);
+      try {
+        const docRef = await addDoc(collection(db, 'studySets'), studySetData);
+        onComplete({ id: docRef.id, ...studySetData } as StudySet);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, 'studySets');
+      }
     } catch (err: any) {
       setError(err.message || 'Something went wrong. Please try again.');
     } finally {
@@ -690,6 +790,18 @@ export default function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // Test connection
+    const testConnection = async () => {
+      try {
+        await getDocFromServer(doc(db, 'test', 'connection'));
+      } catch (error) {
+        if(error instanceof Error && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration.");
+        }
+      }
+    };
+    testConnection();
+
     const unsubscribe = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setLoading(false);
@@ -702,13 +814,15 @@ export default function App() {
           displayName: u.displayName,
           photoURL: u.photoURL,
           createdAt: new Date().toISOString()
-        }, { merge: true });
+        }, { merge: true }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${u.uid}`));
 
         // Listen for study sets
         const q = query(collection(db, 'studySets'), where('userId', '==', u.uid));
         const unsubSets = onSnapshot(q, (snapshot) => {
           const sets = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as StudySet));
           setStudySets(sets.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+        }, (err) => {
+          handleFirestoreError(err, OperationType.LIST, 'studySets');
         });
         return () => unsubSets();
       } else {
@@ -727,103 +841,105 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen">
-      <Navbar user={user} setView={(v) => { setView(v); setSelectedSet(null); }} activeView={view} />
-      
-      <main>
-        {!user ? (
-          <div className="pt-32 pb-20 px-4 text-center max-w-4xl mx-auto">
-            <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="mb-12"
-            >
-              <div className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-full text-sm font-bold mb-6">
-                <Brain size={16} />
-                <span>AI-Powered Learning</span>
-              </div>
-              <h1 className="text-6xl md:text-7xl font-display font-bold tracking-tight mb-6 leading-[1.1]">
-                Snap your notes. <span className="text-indigo-600">Become a savant.</span>
-              </h1>
-              <p className="text-xl text-zinc-500 mb-10 max-w-2xl mx-auto leading-relaxed">
-                Upload photos of your notes and let StudySavant transform them into interactive quizzes and flashcards instantly.
-              </p>
-              <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-                <button 
-                  onClick={signIn}
-                  className="w-full sm:w-auto bg-zinc-900 text-white px-10 py-4 rounded-2xl font-bold text-lg hover:bg-zinc-800 transition-all shadow-xl shadow-zinc-200"
-                >
-                  Get Started for Free
-                </button>
-                <button 
-                  onClick={() => setView('contact')}
-                  className="w-full sm:w-auto bg-white text-zinc-900 border border-zinc-200 px-10 py-4 rounded-2xl font-bold text-lg hover:bg-zinc-50 transition-all"
-                >
-                  Contact Us
-                </button>
-              </div>
-            </motion.div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mt-24">
-              {[
-                { icon: <Plus />, title: "Upload Notes", desc: "Paste your text or notes directly into the app." },
-                { icon: <Brain />, title: "AI Generation", desc: "Our AI analyzes your content to create relevant questions." },
-                { icon: <Layers />, title: "Study & Master", desc: "Use interactive quizzes and flashcards to test your knowledge." }
-              ].map((feature, i) => (
-                <div key={i} className="glass p-8 rounded-3xl text-left">
-                  <div className="w-12 h-12 bg-indigo-600 text-white rounded-2xl flex items-center justify-center mb-6">
-                    {feature.icon}
-                  </div>
-                  <h3 className="text-xl font-bold mb-2">{feature.title}</h3>
-                  <p className="text-zinc-500 text-sm leading-relaxed">{feature.desc}</p>
+    <ErrorBoundary>
+      <div className="min-h-screen">
+        <Navbar user={user} setView={(v) => { setView(v); setSelectedSet(null); }} activeView={view} />
+        
+        <main>
+          {!user ? (
+            <div className="pt-32 pb-20 px-4 text-center max-w-4xl mx-auto">
+              <motion.div
+                initial={{ opacity: 0, scale: 0.9 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="mb-12"
+              >
+                <div className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-full text-sm font-bold mb-6">
+                  <Brain size={16} />
+                  <span>AI-Powered Learning</span>
                 </div>
-              ))}
+                <h1 className="text-6xl md:text-7xl font-display font-bold tracking-tight mb-6 leading-[1.1]">
+                  Snap your notes. <span className="text-indigo-600">Become a savant.</span>
+                </h1>
+                <p className="text-xl text-zinc-500 mb-10 max-w-2xl mx-auto leading-relaxed">
+                  Upload photos of your notes and let StudySavant transform them into interactive quizzes and flashcards instantly.
+                </p>
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
+                  <button 
+                    onClick={signIn}
+                    className="w-full sm:w-auto bg-zinc-900 text-white px-10 py-4 rounded-2xl font-bold text-lg hover:bg-zinc-800 transition-all shadow-xl shadow-zinc-200"
+                  >
+                    Get Started for Free
+                  </button>
+                  <button 
+                    onClick={() => setView('contact')}
+                    className="w-full sm:w-auto bg-white text-zinc-900 border border-zinc-200 px-10 py-4 rounded-2xl font-bold text-lg hover:bg-zinc-50 transition-all"
+                  >
+                    Contact Us
+                  </button>
+                </div>
+              </motion.div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mt-24">
+                {[
+                  { icon: <Plus />, title: "Upload Notes", desc: "Paste your text or notes directly into the app." },
+                  { icon: <Brain />, title: "AI Generation", desc: "Our AI analyzes your content to create relevant questions." },
+                  { icon: <Layers />, title: "Study & Master", desc: "Use interactive quizzes and flashcards to test your knowledge." }
+                ].map((feature, i) => (
+                  <div key={i} className="glass p-8 rounded-3xl text-left">
+                    <div className="w-12 h-12 bg-indigo-600 text-white rounded-2xl flex items-center justify-center mb-6">
+                      {feature.icon}
+                    </div>
+                    <h3 className="text-xl font-bold mb-2">{feature.title}</h3>
+                    <p className="text-zinc-500 text-sm leading-relaxed">{feature.desc}</p>
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
-        ) : (
-          <AnimatePresence mode="wait">
-            {view === 'home' && !selectedSet && (
-              <motion.div key="library" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                <Library 
-                  sets={studySets} 
-                  onSelect={(s) => setSelectedSet(s)} 
-                  onNew={() => setView('upload')} 
-                />
-              </motion.div>
-            )}
-            
-            {view === 'upload' && (
-              <motion.div key="upload" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                <NoteUpload onComplete={(s) => { setSelectedSet(s); setView('home'); }} />
-              </motion.div>
-            )}
+          ) : (
+            <AnimatePresence mode="wait">
+              {view === 'home' && !selectedSet && (
+                <motion.div key="library" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                  <Library 
+                    sets={studySets} 
+                    onSelect={(s) => setSelectedSet(s)} 
+                    onNew={() => setView('upload')} 
+                  />
+                </motion.div>
+              )}
+              
+              {view === 'upload' && (
+                <motion.div key="upload" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                  <NoteUpload onComplete={(s) => { setSelectedSet(s); setView('home'); }} />
+                </motion.div>
+              )}
 
-            {selectedSet && (
-              <motion.div key="detail" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                <StudySetDetail set={selectedSet} onBack={() => setSelectedSet(null)} />
-              </motion.div>
-            )}
+              {selectedSet && (
+                <motion.div key="detail" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                  <StudySetDetail set={selectedSet} onBack={() => setSelectedSet(null)} />
+                </motion.div>
+              )}
 
-            {view === 'contact' && (
-              <motion.div key="contact" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                <ContactUs />
-              </motion.div>
-            )}
-          </AnimatePresence>
-        )}
-      </main>
+              {view === 'contact' && (
+                <motion.div key="contact" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                  <ContactUs />
+                </motion.div>
+              )}
+            </AnimatePresence>
+          )}
+        </main>
 
-      <footer className="border-t border-zinc-200 py-12 bg-white">
-        <div className="max-w-7xl mx-auto px-4 text-center">
-          <div className="flex items-center justify-center gap-2 mb-4">
-            <div className="w-8 h-8 bg-zinc-900 rounded-lg flex items-center justify-center text-white">
-              <Brain size={18} />
+        <footer className="border-t border-zinc-200 py-12 bg-white">
+          <div className="max-w-7xl mx-auto px-4 text-center">
+            <div className="flex items-center justify-center gap-2 mb-4">
+              <div className="w-8 h-8 bg-zinc-900 rounded-lg flex items-center justify-center text-white">
+                <Brain size={18} />
+              </div>
+              <span className="text-lg font-display font-bold tracking-tight">StudySavant</span>
             </div>
-            <span className="text-lg font-display font-bold tracking-tight">StudySavant</span>
+            <p className="text-zinc-400 text-sm">© 2026 StudySavant. All rights reserved.</p>
           </div>
-          <p className="text-zinc-400 text-sm">© 2026 StudySavant. All rights reserved.</p>
-        </div>
-      </footer>
-    </div>
+        </footer>
+      </div>
+    </ErrorBoundary>
   );
 }
