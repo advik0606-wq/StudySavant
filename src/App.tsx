@@ -802,9 +802,18 @@ export default function App() {
     };
     testConnection();
 
+    let unsubSets: (() => void) | null = null;
+
     const unsubscribe = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setLoading(false);
+      
+      // Cleanup previous subscription if any
+      if (unsubSets) {
+        unsubSets();
+        unsubSets = null;
+      }
+
       if (u) {
         // Sync user profile
         const userRef = doc(db, 'users', u.uid);
@@ -814,22 +823,33 @@ export default function App() {
           displayName: u.displayName,
           photoURL: u.photoURL,
           createdAt: new Date().toISOString()
-        }, { merge: true }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${u.uid}`));
+        }, { merge: true }).catch(err => {
+          // Ignore permission errors during initial sync if rules haven't propagated
+          if (err.code !== 'permission-denied') {
+            handleFirestoreError(err, OperationType.WRITE, `users/${u.uid}`);
+          }
+        });
 
         // Listen for study sets
         const q = query(collection(db, 'studySets'), where('userId', '==', u.uid));
-        const unsubSets = onSnapshot(q, (snapshot) => {
+        unsubSets = onSnapshot(q, (snapshot) => {
           const sets = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as StudySet));
           setStudySets(sets.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
         }, (err) => {
-          handleFirestoreError(err, OperationType.LIST, 'studySets');
+          // Only report non-permission errors or report them gracefully
+          if (err.code !== 'permission-denied') {
+            handleFirestoreError(err, OperationType.LIST, 'studySets');
+          }
         });
-        return () => unsubSets();
       } else {
         setStudySets([]);
       }
     });
-    return () => unsubscribe();
+
+    return () => {
+      unsubscribe();
+      if (unsubSets) unsubSets();
+    };
   }, []);
 
   if (loading) {

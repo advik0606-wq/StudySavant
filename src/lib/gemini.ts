@@ -1,7 +1,9 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { QuizQuestion, Flashcard } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+const ai = new GoogleGenAI({ 
+  apiKey: import.meta.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY || "" 
+});
 
 export async function generateStudyMaterials(content: string, imageBase64?: string, mimeType?: string): Promise<{ quiz: QuizQuestion[], flashcards: Flashcard[] }> {
   const model = "gemini-3.1-pro-preview";
